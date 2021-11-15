@@ -34,7 +34,7 @@ for RPORTAL in $RPORTALS; do
   sudo iscsiadm -m node -l all -p "$RPORTAL"
 done
 
-VVS=$(ssh "3paradm@$IP" showvv -showcols Name "$PATTERN" | head -n-2 | tail -n+2 | grep -v '\-backup$')
+VVS=$(ssh "3paradm@$IP" showvv -showcols Name "$PATTERN" | head -n-2 | tail -n+2 | grep -v '\-backup ')
 
 # Perform backup
 for VV in $VVS; do
