@@ -2,9 +2,10 @@
 IP=$1
 PATTERN=$2
 JOBS=${JOBS:-3}
+FIRST_LUN=${FIRST_LUN:-100}
 
 if [ -z "$PATTERN" ]; then
-  "Usage: $0 <3par> <pattern>"
+  echo "Usage: $0 <3par> <pattern>"
   exit 1
 fi
 
@@ -20,16 +21,16 @@ exec_async() {
 }
 
 backup_vv() {
-  LUN=$1 VV=$2 HOST=$HOST IP=$IP bash -sx <<\EOT
+  LUN=$1 VV=$2 HOST=$HOST IP=$IP bash -s <<\EOT
     # cleanup broken devices (just in case)
     OLD_VVS=$(ssh "3paradm@$IP" showvlun -host "$HOST" </dev/null | awk "\$1 == $LUN && \$NF == \"host\" {print \$2}" )
     for OLD_VV in $OLD_VVS; do
       yes | ssh "3paradm@$IP" removevlun "$OLD_VV" "$LUN" "$HOST"
-      iscsiadm -m session --rescan "$RPORTALS"
+      iscsiadm -m session --rescan "$RPORTALS" >/dev/null
 
       ISCSI_DISKS=$(iscsiadm -m session -P3 | grep "Lun: $LUN$" -A1 | awk '/Attached scsi disk/ {print $4}')
       for device in ${ISCSI_DISKS}; do
-        if [ -e /dev/${device} ] && ! fdisk -l /dev/${device}; then
+        if [ -e /dev/${device} ] && ! fdisk -l /dev/${device} >/dev/null 2>&1; then
             blockdev --flushbufs /dev/${device}
             echo 1 > /sys/block/${device}/device/delete
         fi
@@ -42,7 +43,7 @@ backup_vv() {
     yes | ssh "3paradm@$IP" createsv -ro -exp 7d "$VV-backup" "$VV"
     yes | ssh "3paradm@$IP" createvlun "$VV-backup" "$LUN" "$HOST"
     WWN=$(ssh "3paradm@$IP" showvv -showcols VV_WWN "$VV-backup" </dev/null | awk 'FNR == 2 {print tolower($1)}')
-    iscsiadm -m session --rescan "$RPORTALS"
+    iscsiadm -m session --rescan "$RPORTALS" >/dev/null
     ISCSI_DISKS=$(iscsiadm -m session -P3 | grep "Lun: $LUN$" -A1 | awk '/Attached scsi disk/ {print $4}')
     multipath $ISCSI_DISKS
     DM_HOLDER=$(dmsetup ls -o blkdevname | awk "\$1 == \"3$WWN\" {gsub(/[()]/,\"\");print \$2}")
@@ -104,7 +105,6 @@ done
 VVS=$(ssh "3paradm@$IP" showvv -showcols Name "$PATTERN" | head -n-2 | tail -n+2 | grep -v '\-backup ')
 VVS_WC=$(echo "$VVS" | wc -l)
 PORTION="$(($VVS_WC/$JOBS))"
-FIRST_LUN=100
 
 # Set traps to kill background processes
 trap "exit" INT TERM
