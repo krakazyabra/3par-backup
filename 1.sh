@@ -3,6 +3,7 @@ IP=$1
 PATTERN=$2
 JOBS=${JOBS:-3}
 FIRST_LUN=${FIRST_LUN:-100}
+CMD=${CMD:-'set -x; dd if=$DEV of=$VV status=progress bs=16M'}
 
 if [ -z "$PATTERN" ]; then
   echo "Usage: $0 <3par> <pattern>"
@@ -21,7 +22,7 @@ exec_async() {
 }
 
 backup_vv() {
-  LUN=$1 VV=$2 HOST=$HOST IP=$IP bash -s <<\EOT
+  LUN=$1 VV=$2 HOST=$HOST IP=$IP CMD=$CMD bash -s <<\EOT
     # cleanup broken devices (just in case)
     OLD_VVS=$(ssh "3paradm@$IP" showvlun -host "$HOST" </dev/null | awk "\$1 == $LUN && \$NF == \"host\" {print \$2}" )
     for OLD_VV in $OLD_VVS; do
@@ -63,10 +64,7 @@ backup_vv() {
     trap cleanup EXIT
 
     echo Processing $VV-backup
-    (
-      set -x
-      dd if="/dev/$DM_HOLDER" of=/dev/null status=progress bs=16M
-    )
+    echo "$CMD" | DEV="/dev/$DM_HOLDER" LUN=$LUN VV=$VV HOST=$HOST IP=$IP CMD=$CMD bash -s
     cleanup
     trap EXIT
 
