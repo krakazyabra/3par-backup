@@ -111,7 +111,8 @@ trap "kill 0" EXIT
 ## Perform backup
 while read LUN VV; do
   exec_async backup_vv "$LUN" "$VV"
-done < <(echo "$VVS" | awk -v FIRST_LUN="$FIRST_LUN" -v COUNT="$JOBS" '{ f=(f%COUNT)+1 ; print FIRST_LUN + f-1, $0 }')
+done < <(echo -n "$VVS" | awk -v FIRST_LUN="$FIRST_LUN" -v COUNT="$JOBS" '{ f=(f%COUNT)+1 ; print FIRST_LUN + f-1, $0 }')
+
 wait
 
 iscsiadm -m session --rescan $RPORTALS
