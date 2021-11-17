@@ -64,7 +64,7 @@ backup_vv() {
     trap cleanup EXIT
 
     echo Processing $VV-backup
-    echo "$CMD" | DEV="/dev/$DM_HOLDER" LUN=$LUN VV=$VV HOST=$HOST IP=$IP CMD=$CMD bash -s
+    echo "$CMD" | DEV="${DM_HOLDER:+/dev/$DM_HOLDER}" LUN=$LUN VV=$VV HOST=$HOST IP=$IP CMD=$CMD bash -s
     cleanup
     trap EXIT
 
