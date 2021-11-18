@@ -28,14 +28,14 @@ backup_vv() {
     for OLD_VV in $OLD_VVS; do
       yes | ssh "3paradm@$IP" removevlun "$OLD_VV" "$LUN" "$HOST"
       iscsiadm -m session --rescan "$RPORTALS" >/dev/null
+    done
 
-      ISCSI_DISKS=$(iscsiadm -m session -P3 | grep "Lun: $LUN$" -A1 | awk '/Attached scsi disk/ {print $4}')
-      for device in ${ISCSI_DISKS}; do
-        if [ -b /dev/${device} ] && fdisk -l /dev/${device} 2>&1 | grep -q 'No such file or directory'; then
-            blockdev --flushbufs /dev/${device}
-            echo 1 > /sys/block/${device}/device/delete
-        fi
-      done
+    ISCSI_DISKS=$(iscsiadm -m session -P3 | grep "Lun: $LUN$" -A1 | awk '/Attached scsi disk/ {print $4}')
+    for device in ${ISCSI_DISKS}; do
+      if [ -b /dev/${device} ] && fdisk -l /dev/${device} 2>&1 | grep -q 'No such file or directory'; then
+          blockdev --flushbufs /dev/${device}
+          echo 1 > /sys/block/${device}/device/delete
+      fi
     done
 
     yes | ssh "3paradm@$IP" removevv "$VV-backup" 2>/dev/null
