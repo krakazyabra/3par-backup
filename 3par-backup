@@ -46,7 +46,8 @@ backup_vv() {
     WWN=$(ssh "3paradm@$IP" showvv -showcols VV_WWN "$VV-backup" </dev/null | awk 'FNR == 2 {print tolower($1)}')
     iscsiadm -m session --rescan "$RPORTALS" >/dev/null
     ISCSI_DISKS=$(iscsiadm -m session -P3 | grep "Lun: $LUN$" -A1 | awk '/Attached scsi disk/ {print $4}')
-    multipath $ISCSI_DISKS
+    multipath $ISCSI_DISKS >/dev/null
+    sleep 4
     DM_HOLDER=$(dmsetup ls -o blkdevname | awk "\$1 == \"3$WWN\" {gsub(/[()]/,\"\");print \$2}")
     DM_SLAVE=$(ls -1 /sys/block/${DM_HOLDER}/slaves)
 
