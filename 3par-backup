@@ -21,13 +21,23 @@ exec_async() {
   $* &
 }
 
+rescan_portals() {
+    while read SID LPORTAL; do
+      for RPORTAL in $RPORTALS; do
+        if [ "$LPORTAL" = "$RPORTAL" ]; then
+          iscsiadm -m session --rescan -r $SID
+        fi
+      done
+    done < <(iscsiadm -m session | awk '{gsub(/[\[\]]/, "", $2); gsub(/:.*/, "", $3); print $2 " " $3}')
+}
+
 backup_vv() {
   LUN=$1 VV=$2 HOST=$HOST IP=$IP CMD=$CMD bash -s <<\EOT
     # cleanup broken devices (just in case)
     OLD_VVS=$(ssh "3paradm@$IP" showvlun -host "$HOST" </dev/null | awk "\$1 == $LUN && \$NF == \"host\" {print \$2}" )
     for OLD_VV in $OLD_VVS; do
       yes | ssh "3paradm@$IP" removevlun "$OLD_VV" "$LUN" "$HOST"
-      iscsiadm -m session --rescan "$RPORTALS" >/dev/null
+      rescan_iscsi_portals
     done
 
     cleanup() {
@@ -51,7 +61,7 @@ backup_vv() {
     WWN=$(ssh "3paradm@$IP" showvv -showcols VV_WWN "$VV-backup" </dev/null | awk 'FNR == 2 {print tolower($1)}')
     DEV="/dev/disk/by-id/wwn-0x$WWN"
 
-    iscsiadm -m session --rescan "$RPORTALS" >/dev/null
+    rescan_iscsi_portals >/dev/null
     ISCSI_DISKS=$(iscsiadm -m session -P3 | grep "Lun: $LUN$" -A1 | awk '/Attached scsi disk/ {print $4}')
 
     trap cleanup EXIT
@@ -119,7 +129,7 @@ done < <(echo -n "$VVS" | awk -v FIRST_LUN="$FIRST_LUN" -v COUNT="$JOBS" '{ f=(f
 
 wait
 
-iscsiadm -m session --rescan $RPORTALS
+rescan_iscsi_portals
 
 # iSCSI logout
 sudo iscsiadm -m session -o show | while read _ _ LPORTAL _; do
