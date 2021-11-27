@@ -30,13 +30,18 @@ backup_vv() {
       iscsiadm -m session --rescan "$RPORTALS" >/dev/null
     done
 
-    ISCSI_DISKS=$(iscsiadm -m session -P3 | grep "Lun: $LUN$" -A1 | awk '/Attached scsi disk/ {print $4}')
-    for device in ${ISCSI_DISKS}; do
-      if [ -b /dev/${device} ] && fdisk -l /dev/${device} 2>&1 | grep -q 'No such file or directory'; then
-          blockdev --flushbufs /dev/${device}
-          echo 1 > /sys/block/${device}/device/delete
-      fi
-    done
+    cleanup() {
+      # detach
+      ISCSI_DISKS=$(iscsiadm -m session -P3 | grep "Lun: $LUN$" -A1 | awk '/Attached scsi disk/ {print $4}')
+      unset device
+      for device in ${ISCSI_DISKS}; do
+        if [ -b /dev/${device} ] && fdisk -l /dev/${device} 2>&1 | grep -q 'No such file or directory'; then
+            blockdev --flushbufs /dev/${device}
+            echo 1 > /sys/block/${device}/device/delete
+        fi
+      done
+    }
+    cleanup
 
     yes | ssh "3paradm@$IP" removevv "$VV-backup" 2>/dev/null
 
@@ -44,28 +49,26 @@ backup_vv() {
     yes | ssh "3paradm@$IP" createsv -ro -exp 7d "$VV-backup" "$VV"
     yes | ssh "3paradm@$IP" createvlun "$VV-backup" "$LUN" "$HOST"
     WWN=$(ssh "3paradm@$IP" showvv -showcols VV_WWN "$VV-backup" </dev/null | awk 'FNR == 2 {print tolower($1)}')
+    DEV="/dev/disk/by-id/wwn-0x$WWN"
+
     iscsiadm -m session --rescan "$RPORTALS" >/dev/null
     ISCSI_DISKS=$(iscsiadm -m session -P3 | grep "Lun: $LUN$" -A1 | awk '/Attached scsi disk/ {print $4}')
-    multipath $ISCSI_DISKS >/dev/null
-    sleep 4
-    DM_HOLDER=$(dmsetup ls -o blkdevname | awk "\$1 == \"3$WWN\" {gsub(/[()]/,\"\");print \$2}")
-    DM_SLAVE=$(ls -1 /sys/block/${DM_HOLDER}/slaves)
 
-    cleanup() {
-      # detach
-      multipath -f "3${WWN}"
-      unset device
-      for device in ${DM_SLAVE}; do
-        if [ -b /dev/${device} ]; then
-            blockdev --flushbufs /dev/${device}
-            echo 1 > /sys/block/${device}/device/delete
-        fi
-      done
-    }
     trap cleanup EXIT
 
-    echo Processing $VV-backup
-    echo "$CMD" | DEV="${DM_HOLDER:+/dev/$DM_HOLDER}" LUN=$LUN VV=$VV HOST=$HOST IP=$IP CMD=$CMD bash -s
+    echo "Waiting for $DEV"
+    ticker=0
+    until dd if="$DEV" of=/dev/null bs=1 count=1 >/dev/null 2>&1; do
+      sleep 1
+      if [ $((ticker++)) -ge 15 ]; then
+        echo "Error: $DEV for $VV is not readable!"
+        exit 2
+      fi
+    done
+    echo "Device $DEV for $VV found and readable"
+
+    echo Processing $DEV backup for $VV
+    echo "$CMD" | DEV="/dev/disk/by-id/wwn-0x$WWN" LUN=$LUN VV=$VV HOST=$HOST IP=$IP CMD=$CMD bash -s
     cleanup
     trap EXIT
 
