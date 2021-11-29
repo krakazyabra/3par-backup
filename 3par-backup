@@ -10,35 +10,10 @@ if [ -z "$PATTERN" ]; then
   exit 1
 fi
 
-exec_async() {
-  # content of script exec-async.sh
-  joblist=($(jobs -p))
-  while (( ${#joblist[*]} >= $JOBS )); do
-      sleep 1
-      joblist=($(jobs -p))
-  done
-  echo "Starting job: $*"
-  $* &
-}
-
-rescan_portals() {
-    while read SID LPORTAL; do
-      for RPORTAL in $RPORTALS; do
-        if [ "$LPORTAL" = "$RPORTAL" ]; then
-          iscsiadm -m session --rescan -r $SID
-        fi
-      done
-    done < <(iscsiadm -m session | awk '{gsub(/[\[\]]/, "", $2); gsub(/:.*/, "", $3); print $2 " " $3}')
-}
-
-backup_vv() {
-  LUN=$1 VV=$2 HOST=$HOST IP=$IP CMD=$CMD bash -s <<\EOT
-    # cleanup broken devices (just in case)
-    OLD_VVS=$(ssh "3paradm@$IP" showvlun -host "$HOST" </dev/null | awk "\$1 == $LUN && \$NF == \"host\" {print \$2}" )
-    for OLD_VV in $OLD_VVS; do
-      yes | ssh "3paradm@$IP" removevlun "$OLD_VV" "$LUN" "$HOST"
-      rescan_iscsi_portals
-    done
+backup_vvs() {
+  IP=$IP HOST=$HOST CMD=$CMD RPORTALS=$RPORTALS bash -s -- "$@" <<\EOT
+    LUN=$1
+    shift
 
     cleanup() {
       # detach
@@ -51,39 +26,59 @@ backup_vv() {
         fi
       done
     }
-    cleanup
 
-    yes | ssh "3paradm@$IP" removevv "$VV-backup" 2>/dev/null
+    rescan_iscsi_portals() {
+        while read SID LPORTAL; do
+          for RPORTAL in $RPORTALS; do
+            if [ "$LPORTAL" = "$RPORTAL" ]; then
+              iscsiadm -m session --rescan -r $SID
+            fi
+          done
+        done < <(iscsiadm -m session | awk '{gsub(/[\[\]]/, "", $2); gsub(/:.*/, "", $3); print $2 " " $3}')
+    }
 
-    # attach
-    yes | ssh "3paradm@$IP" createsv -ro -exp 7d "$VV-backup" "$VV"
-    yes | ssh "3paradm@$IP" createvlun "$VV-backup" "$LUN" "$HOST"
-    WWN=$(ssh "3paradm@$IP" showvv -showcols VV_WWN "$VV-backup" </dev/null | awk 'FNR == 2 {print tolower($1)}')
-    DEV="/dev/disk/by-id/wwn-0x$WWN"
+    trap 'cleanup; rescan_iscsi_portals' EXIT
 
-    rescan_iscsi_portals >/dev/null
-    ISCSI_DISKS=$(iscsiadm -m session -P3 | grep "Lun: $LUN$" -A1 | awk '/Attached scsi disk/ {print $4}')
+    for VV in "$@"; do
+      # cleanup broken devices (just in case)
+      OLD_VVS=$(ssh "3paradm@$IP" showvlun -host "$HOST" </dev/null | awk "\$1 == $LUN && \$NF == \"host\" {print \$2}" )
+      for OLD_VV in $OLD_VVS; do
+        yes | ssh "3paradm@$IP" removevlun "$OLD_VV" "$LUN" "$HOST"
+        rescan_iscsi_portals
+      done
 
-    trap cleanup EXIT
+      cleanup
 
-    echo "Waiting for $DEV"
-    ticker=0
-    until dd if="$DEV" of=/dev/null bs=1 count=1 >/dev/null 2>&1; do
-      sleep 1
-      if [ $((ticker++)) -ge 15 ]; then
-        echo "Error: $DEV for $VV is not readable!"
-        exit 2
-      fi
+      yes | ssh "3paradm@$IP" removevv "$VV-backup" 2>/dev/null
+
+      # attach
+      yes | ssh "3paradm@$IP" createsv -ro -exp 7d "$VV-backup" "$VV"
+      yes | ssh "3paradm@$IP" createvlun "$VV-backup" "$LUN" "$HOST"
+      WWN=$(ssh "3paradm@$IP" showvv -showcols VV_WWN "$VV-backup" </dev/null | awk 'FNR == 2 {print tolower($1)}')
+      DEV="/dev/disk/by-id/wwn-0x$WWN"
+
+      rescan_iscsi_portals >/dev/null
+      ISCSI_DISKS=$(iscsiadm -m session -P3 | grep "Lun: $LUN$" -A1 | awk '/Attached scsi disk/ {print $4}')
+
+
+      echo "Waiting for $DEV"
+      ticker=0
+      until dd if="$DEV" of=/dev/null bs=1 count=1 >/dev/null 2>&1; do
+        sleep 1
+        if [ $((ticker++)) -ge 60 ]; then
+          echo "Error: $DEV for $VV is not readable!"
+          continue 2
+        fi
+      done
+      echo "Device $DEV for $VV found and readable"
+
+      echo Processing $DEV backup for $VV
+      echo "$CMD" | DEV="/dev/disk/by-id/wwn-0x$WWN" LUN=$LUN VV=$VV HOST=$HOST IP=$IP CMD=$CMD bash -s
+      cleanup
+
+      yes | ssh "3paradm@$IP" removevlun "$VV-backup" "$LUN" "$HOST"
+      yes | ssh "3paradm@$IP" removevv "$VV-backup"
     done
-    echo "Device $DEV for $VV found and readable"
-
-    echo Processing $DEV backup for $VV
-    echo "$CMD" | DEV="/dev/disk/by-id/wwn-0x$WWN" LUN=$LUN VV=$VV HOST=$HOST IP=$IP CMD=$CMD bash -s
-    cleanup
-    trap EXIT
-
-    yes | ssh "3paradm@$IP" removevlun "$VV-backup" "$LUN" "$HOST"
-    yes | ssh "3paradm@$IP" removevv "$VV-backup"
 EOT
 }
 
@@ -114,18 +109,19 @@ for RPORTAL in $RPORTALS; do
   sudo iscsiadm -m node -l all -p "$RPORTAL"
 done
 
-VVS=$(ssh "3paradm@$IP" showvv -showcols Name "$PATTERN" | head -n-2 | tail -n+2 | grep -v '\-backup ')
-VVS_WC=$(echo "$VVS" | wc -l)
-PORTION="$(($VVS_WC/$JOBS))"
+VVS=$(set -x; ssh "3paradm@$IP" showvv -showcols Name "$PATTERN" | head -n-2 | tail -n+2 | grep -v '\-backup ')
 
 # Set traps to kill background processes
 trap "exit" INT TERM
 trap "kill 0" EXIT
 
-## Perform backup
-while read LUN VV; do
-  exec_async backup_vv "$LUN" "$VV"
-done < <(echo -n "$VVS" | awk -v FIRST_LUN="$FIRST_LUN" -v COUNT="$JOBS" '{ f=(f%COUNT)+1 ; print FIRST_LUN + f-1, $0 }')
+# Perform backup
+for j in $(seq 1 $JOBS); do
+  LUN=$(($FIRST_LUN+$j-1))
+  LUN_VVS=$(echo "$VVS" | awk -v COUNT="$JOBS" -v i="$j" '{f=(f%COUNT)+1 ; if (f == i) { print $0 } }')
+  echo "Starting job on LUN=$LUN:" $LUN_VVS
+  backup_vvs "$LUN" $LUN_VVS &
+done
 
 wait
 
