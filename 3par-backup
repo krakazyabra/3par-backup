@@ -10,45 +10,39 @@ if [ -z "$PATTERN" ]; then
   exit 1
 fi
 
-exec_async() {
-  # content of script exec-async.sh
-  joblist=($(jobs -p))
-  while (( ${#joblist[*]} >= $JOBS )); do
+backup_vvs() {
+  IP=$IP HOST=$HOST CMD=$CMD bash -s -- "$@" <<\EOT
+    ISCSIPATH=$1
+    shift
+    for VV in "$@"; do
+      LUN=$(basename "$ISCSIPATH")
+      # cleanup broken devices (just in case)
+      OLD_VVS=$(ssh "3paradm@$IP" showvlun -host "$HOST" </dev/null | awk "\$1 == $LUN && \$NF == \"host\" {print \$2}" )
+      for OLD_VV in $OLD_VVS; do
+        yes | ssh "3paradm@$IP" removevlun "$OLD_VV" "$LUN" "$HOST"
+      done
+
+      yes | ssh "3paradm@$IP" removevv "$VV-backup" 2>/dev/null
+
+      # attach
+      yes | ssh "3paradm@$IP" createsv -ro -exp 7d "$VV-backup" "$VV"
+      yes | ssh "3paradm@$IP" createvlun "$VV-backup" "$LUN" "$HOST"
+
+      echo "Waiting export $ISCSIPATH for $VV"
+      until qemu-img info "$ISCSIPATH" 2>/dev/null; do
+        sleep 1
+        if [ $((ticker++)) -ge 15 ]; then
+          echo "Error: export $ISCSIPATH for $VV is not readable!"
+          exit 2
+        fi
+      done
+      echo "Backing up $ISCSIPATH for $VV"
       sleep 1
-      joblist=($(jobs -p))
-  done
-  echo "Starting job: $*"
-  $* &
-}
+      nbdcopy -- [ qemu-nbd -r "$ISCSIPATH" ] - | VV=$VV sh -c "$CMD"
 
-backup_vv() {
-  ISCSIPATH=$1 VV=$2 IP=$IP HOST=$HOST CMD=$CMD bash -s <<\EOT
-    LUN=$(basename "$ISCSIPATH")
-    # cleanup broken devices (just in case)
-    OLD_VVS=$(ssh "3paradm@$IP" showvlun -host "$HOST" </dev/null | awk "\$1 == $LUN && \$NF == \"host\" {print \$2}" )
-    for OLD_VV in $OLD_VVS; do
-      yes | ssh "3paradm@$IP" removevlun "$OLD_VV" "$LUN" "$HOST"
+      yes | ssh "3paradm@$IP" removevlun "$VV-backup" "$LUN" "$HOST"
+      yes | ssh "3paradm@$IP" removevv "$VV-backup"
     done
-
-    yes | ssh "3paradm@$IP" removevv "$VV-backup" 2>/dev/null
-
-    # attach
-    yes | ssh "3paradm@$IP" createsv -ro -exp 7d "$VV-backup" "$VV"
-    yes | ssh "3paradm@$IP" createvlun "$VV-backup" "$LUN" "$HOST"
-
-    echo "Waiting export $ISCSIPATH for $VV"
-    until qemu-img info "$ISCSIPATH" 2>/dev/null; do
-      sleep 1
-      if [ $((ticker++)) -ge 15 ]; then
-        echo "Error: export $ISCSIPATH for $VV is not readable!"
-        exit 2
-      fi
-    done
-    echo "Backing up $ISCSIPATH for $VV"
-    nbdcopy -- [ qemu-nbd -r "$ISCSIPATH" ] - | VV=$VV sh -c "$CMD"
-
-    yes | ssh "3paradm@$IP" removevlun "$VV-backup" "$LUN" "$HOST"
-    yes | ssh "3paradm@$IP" removevv "$VV-backup"
 EOT
 }
 
@@ -90,9 +84,12 @@ PORTION="$(($VVS_WC/$JOBS))"
 trap "exit" INT TERM
 trap "kill 0" EXIT
 
-# Perform backup
-while read LUN VV; do
-  exec_async backup_vv "${ISCSIPATHS[$(($((i++)) % ${#ISCSIPATHS[@]}))]}/$LUN" "$VV"
-done < <(echo -n "$VVS" | awk -v FIRST_LUN="$FIRST_LUN" -v COUNT="$JOBS" '{ f=(f%COUNT)+1 ; print FIRST_LUN + f-1, $0 }')
+for i in $(seq 1 $JOBS); do
+  LUN=$(($FIRST_LUN+$i-1))
+  VVS=$(echo "$VVS" | awk -v COUNT="$JOBS" -v i="$i" '{f=(f%COUNT)+1 ; if (f == i) { print $0 } }')
+  ISCSIPATH="${ISCSIPATHS[$(($((i++)) % ${#ISCSIPATHS[@]}))]}/$LUN"
+  echo "Starting job: $ISCSIPATH" $VVS
+  backup_vvs "$ISCSIPATH" $VVS &
+done
 
 wait
