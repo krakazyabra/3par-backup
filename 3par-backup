@@ -3,7 +3,7 @@ IP=$1
 PATTERN=$2
 JOBS=${JOBS:-3}
 FIRST_LUN=${FIRST_LUN:-100}
-CMD=${CMD:-'set -x; dd if=$DEV of=$VV status=progress bs=16M'}
+CMD=${CMD:-'set -x; dd of=$VV status=progress bs=16M'}
 
 if [ -z "$PATTERN" ]; then
   echo "Usage: $0 <3par> <pattern>"
@@ -21,98 +21,66 @@ exec_async() {
   $* &
 }
 
-rescan_portals() {
-    while read SID LPORTAL; do
-      for RPORTAL in $RPORTALS; do
-        if [ "$LPORTAL" = "$RPORTAL" ]; then
-          iscsiadm -m session --rescan -r $SID
-        fi
-      done
-    done < <(iscsiadm -m session | awk '{gsub(/[\[\]]/, "", $2); gsub(/:.*/, "", $3); print $2 " " $3}')
-}
-
 backup_vv() {
-  LUN=$1 VV=$2 HOST=$HOST IP=$IP CMD=$CMD bash -s <<\EOT
+  ISCSIPATH=$1 VV=$2 IP=$IP HOST=$HOST CMD=$CMD bash -s <<\EOT
+    LUN=$(basename "$ISCSIPATH")
     # cleanup broken devices (just in case)
     OLD_VVS=$(ssh "3paradm@$IP" showvlun -host "$HOST" </dev/null | awk "\$1 == $LUN && \$NF == \"host\" {print \$2}" )
     for OLD_VV in $OLD_VVS; do
       yes | ssh "3paradm@$IP" removevlun "$OLD_VV" "$LUN" "$HOST"
-      rescan_iscsi_portals
     done
-
-    cleanup() {
-      # detach
-      ISCSI_DISKS=$(iscsiadm -m session -P3 | grep "Lun: $LUN$" -A1 | awk '/Attached scsi disk/ {print $4}')
-      unset device
-      for device in ${ISCSI_DISKS}; do
-        if [ -b /dev/${device} ] && fdisk -l /dev/${device} 2>&1 | grep -q 'No such file or directory'; then
-            blockdev --flushbufs /dev/${device}
-            echo 1 > /sys/block/${device}/device/delete
-        fi
-      done
-    }
-    cleanup
 
     yes | ssh "3paradm@$IP" removevv "$VV-backup" 2>/dev/null
 
     # attach
     yes | ssh "3paradm@$IP" createsv -ro -exp 7d "$VV-backup" "$VV"
     yes | ssh "3paradm@$IP" createvlun "$VV-backup" "$LUN" "$HOST"
-    WWN=$(ssh "3paradm@$IP" showvv -showcols VV_WWN "$VV-backup" </dev/null | awk 'FNR == 2 {print tolower($1)}')
-    DEV="/dev/disk/by-id/wwn-0x$WWN"
 
-    rescan_iscsi_portals >/dev/null
-    ISCSI_DISKS=$(iscsiadm -m session -P3 | grep "Lun: $LUN$" -A1 | awk '/Attached scsi disk/ {print $4}')
-
-    trap cleanup EXIT
-
-    echo "Waiting for $DEV"
-    ticker=0
-    until dd if="$DEV" of=/dev/null bs=1 count=1 >/dev/null 2>&1; do
+    echo "Waiting export $ISCSIPATH for $VV"
+    until qemu-img info "$ISCSIPATH" 2>/dev/null; do
       sleep 1
       if [ $((ticker++)) -ge 15 ]; then
-        echo "Error: $DEV for $VV is not readable!"
+        echo "Error: export $ISCSIPATH for $VV is not readable!"
         exit 2
       fi
     done
-    echo "Device $DEV for $VV found and readable"
-
-    echo Processing $DEV backup for $VV
-    echo "$CMD" | DEV="/dev/disk/by-id/wwn-0x$WWN" LUN=$LUN VV=$VV HOST=$HOST IP=$IP CMD=$CMD bash -s
-    cleanup
-    trap EXIT
+    echo "Backing up $ISCSIPATH for $VV"
+    nbdcopy -- [ qemu-nbd -r "$ISCSIPATH" ] - | VV=$VV sh -c "$CMD"
 
     yes | ssh "3paradm@$IP" removevlun "$VV-backup" "$LUN" "$HOST"
     yes | ssh "3paradm@$IP" removevv "$VV-backup"
 EOT
 }
 
-# Setup host
-INITIATOR_NAME=$(awk -F= '{print $2}' /etc/iscsi/initiatorname.iscsi)
-HOST=$(hostname -s)
+command -V nbdcopy || exit $?
+command -V qemu-img || exit $?
 
-if [ -z "$INITIATOR_NAME" ] || [ -z "$HOST" ] || [ -z "$IP" ]; then
-  echo "INITIATOR_NAME, HOST or IP is empty!" >&2
+# Initiator name 'iqn.2008-11.org.linux-kvm' harcoded to qemu-img
+INITIATORNAME=iqn.2008-11.org.linux-kvm
+HOST=qemu-img
+
+# Create host on 3par if not created yet
+echo "Creating host qemu-img on 3par"
+OUT=$(ssh "3paradm@$IP" createhost -iscsi "$HOST" "$INITIATORNAME" 2>&1)
+if [ $? -ne 0 ] && ! echo "$OUT" | grep "already used by host $HOST"; then
+  echo "$OUT"
   exit 1
 fi
 
-ssh "3paradm@$IP" createhost -iscsi "$HOST" "$INITIATOR_NAME"
-
 # ---------------------------
 
-RPORTALS=$(ssh "3paradm@$IP" showport -iscsivlans | tail -n+2 | head -n-2 | awk '{print $3}')
-LPORTALS=$(sudo iscsiadm -m session -o show | awk -F '[ :,]+' '{print $3}')
+PORTALS=$(ssh "3paradm@$IP" showport -iscsivlans | head -n-2 | tail -n+2)
+TARGETNAMES=$(ssh "3paradm@$IP" showport -iscsiname | head -n-2 | tail -n+2)
+ISCSIPATHS=()
 
-# iSCSI login
-for RPORTAL in $RPORTALS; do
-  for LPORTAL in $LPORTALS; do
-    if [ "$LPORTALS" = "$RPORTAL" ]; then
+while read PPORT _ PIP _; do
+  while read TPORT _ TNAME; do
+    if [ "$PPORT" = "$TPORT" ]; then
+      ISCSIPATHS+=("iscsi://$PIP/$TNAME")
       continue 2
     fi
-  done
-  sudo iscsiadm -m discovery -t sendtargets -p "$RPORTAL"
-  sudo iscsiadm -m node -l all -p "$RPORTAL"
-done
+  done < <(echo "$TARGETNAMES")
+done < <(echo "$PORTALS")
 
 VVS=$(ssh "3paradm@$IP" showvv -showcols Name "$PATTERN" | head -n-2 | tail -n+2 | grep -v '\-backup ')
 VVS_WC=$(echo "$VVS" | wc -l)
@@ -122,22 +90,9 @@ PORTION="$(($VVS_WC/$JOBS))"
 trap "exit" INT TERM
 trap "kill 0" EXIT
 
-## Perform backup
+# Perform backup
 while read LUN VV; do
-  exec_async backup_vv "$LUN" "$VV"
+  exec_async backup_vv "${ISCSIPATHS[$(($((i++)) % ${#ISCSIPATHS[@]}))]}/$LUN" "$VV"
 done < <(echo -n "$VVS" | awk -v FIRST_LUN="$FIRST_LUN" -v COUNT="$JOBS" '{ f=(f%COUNT)+1 ; print FIRST_LUN + f-1, $0 }')
 
 wait
-
-rescan_iscsi_portals
-
-# iSCSI logout
-sudo iscsiadm -m session -o show | while read _ _ LPORTAL _; do
-  for RPORTAL in $RPORTALS; do
-    if [ "$LPORTAL" = "$RPORTAL" ]; then
-      sudo iscsiadm --mode node -u -p "$RPORTAL"
-    fi
-  done
-done
-
-ssh "3paradm@$IP" removehost "$HOST"
